@@ -1,11 +1,16 @@
 /// <reference path="../pb_data/types.d.ts" />
 
-// Registers a custom API endpoint POST /api/billing/run-cycle
-routerAdd("POST", "/api/billing/run-cycle", (c) => {
+
+cronAdd("billing_run", "0 0 * * *", () => {
+
+    const l = $app.logger().withGroup("billing_run")
+
+    l.info("Invoice generation started.")
+
     // 1. Fetch all active subscriptions that have hit their period end date
     const nowIso = new Date().toISOString();
 
-    const subscriptions = $app.dao().findRecordsByFilter(
+    const subscriptions = $app.findRecordsByFilter(
         "subscriptions",
         "status = 'active' && current_period_end <= {:now}",
         "-current_period_end",
@@ -17,7 +22,7 @@ routerAdd("POST", "/api/billing/run-cycle", (c) => {
     let invoicesCreated = 0;
 
     // Use a transaction to ensure all database writes succeed or roll back together
-    $app.dao().runInTransaction((txDao) => {
+    $app.runInTransaction((txDao) => {
         for (let sub of subscriptions) {
             const customerId = sub.get("customer");
             const subscriptionId = sub.id;
@@ -106,6 +111,10 @@ routerAdd("POST", "/api/billing/run-cycle", (c) => {
             const calculatedTax = calculatedSubtotal * taxRate;
             const calculatedTotal = calculatedSubtotal + calculatedTax;
 
+            const customer = txDao.findRecordById("customers", customerId);
+            const customerEmail = customer.get("email");
+            const customerName = customer.get("company_name");
+
             invoice.set("subtotal_amount", calculatedSubtotal);
             invoice.set("tax_amount", calculatedTax);
             invoice.set("total_amount", calculatedTotal);
@@ -117,16 +126,68 @@ routerAdd("POST", "/api/billing/run-cycle", (c) => {
             parsedEnd.setMonth(parsedEnd.getMonth() + 1); // Advance 1 month
             const newEnd = parsedEnd.toISOString();
 
+            const emailHtml = `
+                <div style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; border: 1px solid #eee;">
+                    <h2 style="color: #333;">New Invoice Generated</h2>
+                    <p>Hello ${customerName},</p>
+                    <p>Your subscription billing cycle ending <strong>${new Date(currentEnd).toLocaleDateString()}</strong> has closed.</p>
+                    
+                    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                        <tr style="background: #f8f9fa;">
+                            <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">Invoice Number</th>
+                            <th style="padding: 10px; text-align: right; border-bottom: 2px solid #ddd;">Amount Due</th>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px; border-bottom: 1px solid #ddd;">${invoice.get("invoice_number")}</td>
+                            <td style="padding: 10px; text-align: right; font-weight: bold; border-bottom: 1px solid #ddd;">
+                                $${invoice.get("total_amount").toFixed(2)}
+                            </td>
+                        </tr>
+                    </table>
+
+                    <p>The amount due has been posted to your account and is payable by <strong>${new Date(invoice.get("due_date")).toLocaleDateString()}</strong>.</p>
+                    <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for your business!</p>
+                </div>
+            `;
+
+
             sub.set("current_period_start", newStart);
             sub.set("current_period_end", newEnd);
             txDao.saveRecord(sub);
+
+            // 8. Queue and send the email natively via PocketBase Mailer
+            try {
+
+                const message = new MailerMessage({
+                    from: {
+                        address: $app.settings().meta.senderAddress,
+                        name: $app.settings().meta.senderName,
+                    },
+                    to:      [{ address: customerEmail }],
+                    subject: `Invoice ${invoice.get("invoice_number")} from Billing System`,
+                    html:    emailHtml,
+                })
+
+                $app.newMailClient().send(message)
+
+            } catch (err) {
+                // Log mailing failures to console, but don't crash the database transaction loop
+                console.error(`Failed to send email to ${customerEmail}:`, err);
+            }
 
             invoicesCreated++;
         }
     });
 
+    l.info("Invoice generation complete.")
+
+    return true;
+})
+
+// Registers a custom API endpoint POST /api/billing/run-cycle
+routerAdd("POST", "/api/billing/run-cycle", (c) => {
     return c.json(200, {
         status: "success",
-        message: `Processed billing cycle. Invoices generated: ${invoicesCreated}`
+        message: `Processed billing cycle`
     });
-}, $apis.requireAdminAuth()); // Restricts endpoint access strictly to PocketBase Admin accounts
+}, $apis.requireSuperuserAuth()); // Restricts endpoint access strictly to PocketBase Admin accounts
