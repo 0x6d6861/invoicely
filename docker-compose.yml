@@ -1,0 +1,12 @@
+version: "3.7"
+services:
+  pocketbase:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./src/pb_data:/pb/pb_data
+      - ./src/pb_hooks:/pb/pb_hooks
+      - ./src/pb_migrations:/pb/pb_migrations
+    ports:
+      - "8080:8080"
